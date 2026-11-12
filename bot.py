@@ -191,7 +191,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
+    message = update.effective_message
+    if not private_chat(update):
+        return
+
+    await message.reply_text(
         "File Store Bot Help\n\n"
         "File upload: Koi document, photo, video ya audio bhejo.\n"
         "/myfiles - Apni files dekho\n"
@@ -287,6 +291,9 @@ async def myfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
 
+    if not private_chat(update):
+        return
+
     page = 1
 
     if context.args:
@@ -337,6 +344,9 @@ async def share_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
 
+    if not private_chat(update):
+        return
+
     if not context.args:
         await message.reply_text("Use: /share FILE_ID")
         return
@@ -377,6 +387,9 @@ async def unshare_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
 
+    if not private_chat(update):
+        return
+
     if not context.args:
         await message.reply_text("Use: /unshare FILE_ID")
         return
@@ -406,6 +419,9 @@ async def unshare_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
+
+    if not private_chat(update):
+        return
 
     if not context.args:
         await message.reply_text("Use: /delete FILE_ID")
@@ -547,5 +563,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         log_level="info",
-    )
+        )
     
