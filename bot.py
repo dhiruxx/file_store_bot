@@ -488,7 +488,7 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(worker_loop())
     log.info("Bot started as @%s", BOT_USERNAME)
     yield
-        if worker_task:
+  if worker_task:
         worker_task.cancel()
         try:
             await worker_task
@@ -499,7 +499,6 @@ async def lifespan(app: FastAPI):
     await tg_app.stop()
     await tg_app.shutdown()
     await db_pool.close()
-
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
