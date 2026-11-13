@@ -488,12 +488,13 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(worker_loop())
     log.info("Bot started as @%s", BOT_USERNAME)
     yield
-    if worker_task:
+        if worker_task:
         worker_task.cancel()
         try:
-        await worker_task
+            await worker_task
         except asyncio.CancelledError:
             pass
+
     await tg_app.bot.delete_webhook()
     await tg_app.stop()
     await tg_app.shutdown()
