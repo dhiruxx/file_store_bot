@@ -1,11 +1,17 @@
-import os
+
+import asyncio
 import logging
+import os
+import re
 import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import asyncpg
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus
+from telegram.error import TelegramError, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,52 +21,9 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
-# ENVIRONMENT CONFIGURATION
-# =========================
-
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-DATABASE_URL = os.environ["DATABASE_URL"]
-STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
-
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "").split(",")
-    if x.strip()
-}
-
-# Channel IDs are separated by commas
-FORCE_CHANNELS = [
-    int(x.strip())
-    for x in os.environ.get("FORCE_CHANNELS", "").split(",")
-    if x.strip()
-]
-
-# Channel links are separated by semicolons
-FORCE_LINKS = [
-    x.strip()
-    for x in os.environ.get("FORCE_LINKS", "").split(";")
-    if x.strip()
-]
-
-MAX_FILES = 1000
-MAX_FILE_MB = 40
-MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
-
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
-PORT = int(os.environ.get("PORT", "10000"))
-
-print("DEBUG FORCE_CHANNELS:", len(FORCE_CHANNELS))
-print("DEBUG FORCE_LINKS:", len(FORCE_LINKS))
-
-if len(FORCE_CHANNELS) != 5 or len(FORCE_LINKS) != 5:
-    raise RuntimeError(
-        "FORCE_CHANNELS aur FORCE_LINKS mein exactly 5-5 values honi chahiye."
-    )
-
-if len(ADMIN_IDS) == 0:
-    raise RuntimeError("ADMIN_IDS mein kam se kam ek admin Telegram ID daalo.")
+# =====================================
+# LOGGING
+# =====================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,14 +32,86 @@ logging.basicConfig(
 
 log = logging.getLogger("file-store-bot")
 
+
+# =====================================
+# ENVIRONMENT SETTINGS
+# =====================================
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
+
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
+    if x.strip()
+}
+
+# Channel IDs: comma, semicolon or space separated
+FORCE_CHANNELS = [
+    int(x.strip())
+    for x in re.split(
+        r"[,;\s]+",
+        os.environ.get("FORCE_CHANNELS", "").strip()
+    )
+    if x.strip()
+]
+
+# Channel links: comma, semicolon or space separated
+FORCE_LINKS = [
+    x.strip()
+    for x in re.split(
+        r"[,;\s]+",
+        os.environ.get("FORCE_LINKS", "").strip()
+    )
+    if x.strip()
+]
+
+MAX_FILES = 1000
+MAX_FILE_MB = 40
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+
+LINK_EXPIRY_HOURS = 2
+
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+
+log.info("FORCE_CHANNELS count: %s", len(FORCE_CHANNELS))
+log.info("FORCE_LINKS count: %s", len(FORCE_LINKS))
+
+if len(FORCE_CHANNELS) != 5 or len(FORCE_LINKS) != 5:
+    raise RuntimeError(
+        f"Channel IDs mile: {len(FORCE_CHANNELS)}, "
+        f"channel links mile: {len(FORCE_LINKS)}. "
+        "Render Environment check karo."
+    )
+
+if not ADMIN_IDS:
+    raise RuntimeError("ADMIN_IDS mein kam se kam ek admin ID zaroori hai.")
+
+if not WEBHOOK_URL:
+    raise RuntimeError("WEBHOOK_URL Render Environment mein missing hai.")
+
+
+# =====================================
+# GLOBAL VARIABLES
+# =====================================
+
 db_pool = None
 telegram_app = None
-upload_sessions = {}
+BOT_USERNAME = ""
+
+admin_upload_sessions = set()
+upload_file_ids = {}
+
+worker_task = None
 
 
-# =========================
+# =====================================
 # DATABASE
-# =========================
+# =====================================
 
 async def init_db():
     global db_pool
@@ -90,32 +125,75 @@ async def init_db():
     )
 
     async with db_pool.acquire() as conn:
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
-                first_seen TIMESTAMPTZ DEFAULT NOW()
-            );
+                username TEXT,
+                first_name TEXT,
+                last_seen TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
 
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 id BIGSERIAL PRIMARY KEY,
                 storage_message_id BIGINT NOT NULL,
+                file_name TEXT NOT NULL,
                 file_size BIGINT NOT NULL,
+                media_type TEXT NOT NULL,
                 added_by BIGINT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW()
-            );
+            )
+        """)
 
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS bundles (
-                code TEXT PRIMARY KEY,
-                created_by BIGINT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
+                token TEXT PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                activated_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ
+            )
+        """)
 
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS bundle_files (
-                bundle_code TEXT REFERENCES bundles(code) ON DELETE CASCADE,
-                file_id BIGINT REFERENCES files(id) ON DELETE CASCADE,
+                bundle_token TEXT NOT NULL
+                    REFERENCES bundles(token) ON DELETE CASCADE,
+                file_id BIGINT NOT NULL
+                    REFERENCES files(id),
                 position INTEGER NOT NULL,
-                PRIMARY KEY (bundle_code, file_id)
-            );
+                PRIMARY KEY (bundle_token, file_id),
+                UNIQUE (bundle_token, position)
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_access (
+                user_id BIGINT PRIMARY KEY,
+                bundle_token TEXT NOT NULL
+                    REFERENCES bundles(token) ON DELETE CASCADE,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS delivery_jobs (
+                id BIGSERIAL PRIMARY KEY,
+                bundle_token TEXT NOT NULL
+                    REFERENCES bundles(token) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                next_index INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'queued',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_delivery_jobs_status
+            ON delivery_jobs(status, created_at)
         """)
 
     log.info("Database ready")
@@ -129,468 +207,878 @@ async def close_db():
         db_pool = None
 
 
-# =========================
-# SUBSCRIPTION SYSTEM
-# =========================
+# =====================================
+# ADMIN CHECK
+# =====================================
 
-async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    for channel_id in FORCE_CHANNELS:
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+# =====================================
+# SAVE USER
+# =====================================
+
+async def save_user(user):
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users(user_id, username, first_name)
+            VALUES($1, $2, $3)
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_seen = NOW()
+            """,
+            user.id,
+            user.username,
+            user.first_name,
+        )
+
+
+# =====================================
+# FORCE SUBSCRIPTION
+# =====================================
+
+async def subscribed_to_all(user_id, context):
+
+    missing = []
+
+    for channel_id, invite_link in zip(
+        FORCE_CHANNELS,
+        FORCE_LINKS
+    ):
+
         try:
             member = await context.bot.get_chat_member(
                 chat_id=channel_id,
                 user_id=user_id,
             )
 
-            if member.status not in ("member", "administrator", "creator"):
-                return False
+            if (
+                member.status in (
+                    ChatMemberStatus.LEFT,
+                    ChatMemberStatus.BANNED,
+                )
+                or (
+                    member.status == ChatMemberStatus.RESTRICTED
+                    and not member.is_member
+                )
+            ):
+                missing.append(invite_link)
 
-        except Exception as exc:
-            log.warning(
-                "Subscription check failed for channel %s: %s",
+        except TelegramError:
+            log.exception(
+                "Membership check failed for channel %s",
                 channel_id,
-                exc,
             )
-            return False
+            missing.append(invite_link)
 
-    return True
+    return missing
 
 
-def force_sub_keyboard():
-    rows = []
+def subscription_keyboard(missing):
 
-    for index, link in enumerate(FORCE_LINKS, start=1):
-        rows.append([
+    buttons = []
+
+    for index, link in enumerate(missing, start=1):
+        buttons.append([
             InlineKeyboardButton(
                 f"Join Channel {index}",
                 url=link,
             )
         ])
 
-    rows.append([
+    buttons.append([
         InlineKeyboardButton(
-            "I have joined - Verify",
-            callback_data="verify_sub",
+            "I Joined - Verify",
+            callback_data="verify",
         )
     ])
 
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(buttons)
 
 
-async def require_subscription(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user = update.effective_user
+async def show_subscription_prompt(chat_id, missing, context):
 
-    if not user:
-        return False
-
-    if await is_subscribed(user.id, context):
-        return True
-
-    message_text = (
-        "Bot use karne se pehle neeche diye gaye 5 channels join karo.\n"
-        "Join karne ke baad Verify dabao."
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Files lene se pehle hamare 5 channels join karein.\n\n"
+            "Sabhi channels join karne ke baad "
+            "'I Joined - Verify' button dabayein."
+        ),
+        reply_markup=subscription_keyboard(missing),
     )
 
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            message_text,
-            reply_markup=force_sub_keyboard(),
+
+# =====================================
+# BUNDLE ACTIVATION
+# =====================================
+
+async def activate_bundle(token):
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            """
+            UPDATE bundles
+            SET
+                activated_at = COALESCE(activated_at, NOW()),
+                expires_at = COALESCE(
+                    expires_at,
+                    NOW() + ($2 * INTERVAL '1 hour')
+                )
+            WHERE token = $1
+            RETURNING activated_at, expires_at
+            """,
+            token,
+            LINK_EXPIRY_HOURS,
         )
 
-    elif update.effective_message:
+    return row
+
+
+# =====================================
+# QUEUE DELIVERY
+# =====================================
+
+async def queue_delivery(token, user_id, chat_id, context):
+
+    async with db_pool.acquire() as conn:
+
+        bundle = await conn.fetchrow(
+            """
+            SELECT expires_at
+            FROM bundles
+            WHERE token = $1
+            """,
+            token,
+        )
+
+        if not bundle:
+            await context.bot.send_message(
+                chat_id,
+                "Ye link valid nahi hai.",
+            )
+            return
+
+        if (
+            bundle["expires_at"] is None
+            or bundle["expires_at"] <= datetime.now(timezone.utc)
+        ):
+            await context.bot.send_message(
+                chat_id,
+                "Is link ki validity khatam ho gayi hai.",
+            )
+            return
+
+        count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM bundle_files
+            WHERE bundle_token = $1
+            """,
+            token,
+        )
+
+        if not count:
+            await context.bot.send_message(
+                chat_id,
+                "Is link mein koi file nahi hai.",
+            )
+            return
+
+        job_id = await conn.fetchval(
+            """
+            INSERT INTO delivery_jobs(
+                bundle_token,
+                user_id,
+                status
+            )
+            VALUES($1, $2, 'queued')
+            RETURNING id
+            """,
+            token,
+            user_id,
+        )
+
+    await context.bot.send_message(
+        chat_id,
+        f"Subscription verified!\n"
+        f"Total files: {count}\n"
+        f"Delivery queue mein laga di gayi hai.\n"
+        f"Job ID: {job_id}\n\n"
+        "Files batches mein aayengi.",
+    )
+
+
+# =====================================
+# START COMMAND
+# =====================================
+
+async def start(update, context):
+
+    user = update.effective_user
+
+    await save_user(user)
+
+    if not context.args:
+
         await update.effective_message.reply_text(
-            message_text,
-            reply_markup=force_sub_keyboard(),
+            "Welcome to File Store Bot!\n\n"
+            "Agar aapke paas file share link hai, "
+            "use open karein.\n\n"
+            "Admin commands:\n"
+            "/addfiles - Upload files\n"
+            "/done - Create share link\n"
+            "/cancel - Cancel upload\n"
+            "/stats - Storage statistics"
         )
 
-    return False
+        return
+
+    arg = context.args[0]
+
+    if not arg.startswith("get_"):
+
+        await update.effective_message.reply_text(
+            "Invalid link. Sahi share link open karein."
+        )
+
+        return
+
+    token = arg[4:]
+
+    async with db_pool.acquire() as conn:
+
+        bundle = await conn.fetchrow(
+            "SELECT token FROM bundles WHERE token = $1",
+            token,
+        )
+
+    if not bundle:
+
+        await update.effective_message.reply_text(
+            "Ye link valid nahi hai ya delete ho chuka hai."
+        )
+
+        return
+
+    await activate_bundle(token)
+
+    async with db_pool.acquire() as conn:
+
+        status = await conn.fetchrow(
+            """
+            SELECT expires_at
+            FROM bundles
+            WHERE token = $1
+            """,
+            token,
+        )
+
+    if (
+        not status
+        or status["expires_at"] <= datetime.now(timezone.utc)
+    ):
+
+        await update.effective_message.reply_text(
+            "Is link ki validity khatam ho gayi hai."
+        )
+
+        return
+
+    missing = await subscribed_to_all(user.id, context)
+
+    if missing:
+
+        await show_subscription_prompt(
+            update.effective_chat.id,
+            missing,
+            context,
+        )
+
+        async with db_pool.acquire() as conn:
+
+            await conn.execute(
+                """
+                INSERT INTO pending_access(
+                    user_id,
+                    bundle_token,
+                    updated_at
+                )
+                VALUES($1, $2, NOW())
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    bundle_token = EXCLUDED.bundle_token,
+                    updated_at = NOW()
+                """,
+                user.id,
+                token,
+            )
+
+        return
+
+    await queue_delivery(
+        token,
+        user.id,
+        update.effective_chat.id,
+        context,
+    )
 
 
-async def verify_subscription(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+# =====================================
+# VERIFY SUBSCRIPTION BUTTON
+# =====================================
+
+async def verify_callback(update, context):
+
     query = update.callback_query
+
     await query.answer()
 
-    if await is_subscribed(query.from_user.id, context):
-        await query.edit_message_text(
-            "Subscription verify ho gaya. Ab /start bhejo."
+    user_id = query.from_user.id
+
+    missing = await subscribed_to_all(
+        user_id,
+        context,
+    )
+
+    if missing:
+
+        await query.message.reply_text(
+            "Abhi kuch channels join nahi hue hain.\n"
+            "Sabhi 5 channels join karke phir Verify dabayein.",
+            reply_markup=subscription_keyboard(missing),
         )
-    else:
-        await query.edit_message_text(
-            "Abhi sabhi 5 channels join nahi hue. Join karke dobara Verify dabao.",
-            reply_markup=force_sub_keyboard(),
-        )
 
+        return
 
-# =========================
-# ADMIN AND USER FUNCTIONS
-# =========================
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-async def save_user(user_id: int):
     async with db_pool.acquire() as conn:
-        await conn.execute(
+
+        row = await conn.fetchrow(
             """
-            INSERT INTO users(user_id)
-            VALUES($1)
-            ON CONFLICT DO NOTHING
+            SELECT bundle_token
+            FROM pending_access
+            WHERE user_id = $1
             """,
             user_id,
         )
 
+        await conn.execute(
+            "DELETE FROM pending_access WHERE user_id = $1",
+            user_id,
+        )
 
-# =========================
-# START COMMAND
-# =========================
+    if not row:
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await query.message.reply_text(
+            "Pending link nahi mila. Share link dobara open karein."
+        )
+
+        return
+
+    await queue_delivery(
+        row["bundle_token"],
+        user_id,
+        query.message.chat_id,
+        context,
+    )
+
+
+# =====================================
+# ADD FILES COMMAND
+# =====================================
+
+async def addfiles(update, context):
+
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+
+        await update.effective_message.reply_text(
+            "Access denied."
+        )
+
+        return
+
+    admin_upload_sessions.add(user_id)
+
+    upload_file_ids.setdefault(user_id, [])
+
+    await update.effective_message.reply_text(
+        "File upload mode ON!\n\n"
+        "Ab ek-ek karke ya multiple files bhejein.\n"
+        "Sab files bhejne ke baad /done likhein.\n"
+        "Cancel karne ke liye /cancel likhein."
+    )
+
+
+# =====================================
+# CANCEL COMMAND
+# =====================================
+
+async def cancel_upload(update, context):
+
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        return
+
+    admin_upload_sessions.discard(user_id)
+    upload_file_ids.pop(user_id, None)
+
+    await update.effective_message.reply_text(
+        "Upload session cancel kar diya gaya."
+    )
+
+
+# =====================================
+# RECEIVE FILES
+# =====================================
+
+async def receive_file(update, context):
+
     user = update.effective_user
 
-    await save_user(user.id)
-
-    if not await require_subscription(update, context):
+    if not user or user.id not in admin_upload_sessions:
         return
 
-    if context.args:
-        code = context.args[0].strip()
+    msg = update.effective_message
 
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT f.storage_message_id
-                FROM bundle_files bf
-                JOIN files f ON f.id = bf.file_id
-                WHERE bf.bundle_code = $1
-                ORDER BY bf.position
-                """,
-                code,
-            )
+    media = None
+    media_type = ""
+    file_name = ""
+    file_size = 0
 
-        if not rows:
-            await update.message.reply_text(
-                "Ye link invalid hai ya files available nahi hain."
-            )
-            return
+    if msg.document:
 
-        await update.message.reply_text(
-            f"Is link mein {len(rows)} file(s) hain. Files bheji ja rahi hain..."
+        media = msg.document
+        media_type = "document"
+        file_name = (
+            msg.document.file_name
+            or f"document_{msg.message_id}"
+        )
+        file_size = msg.document.file_size or 0
+
+    elif msg.video:
+
+        media = msg.video
+        media_type = "video"
+        file_name = (
+            msg.video.file_name
+            or f"video_{msg.message_id}.mp4"
+        )
+        file_size = msg.video.file_size or 0
+
+    elif msg.audio:
+
+        media = msg.audio
+        media_type = "audio"
+        file_name = (
+            msg.audio.file_name
+            or f"audio_{msg.message_id}"
+        )
+        file_size = msg.audio.file_size or 0
+
+    elif msg.animation:
+
+        media = msg.animation
+        media_type = "animation"
+        file_name = (
+            msg.animation.file_name
+            or f"animation_{msg.message_id}.mp4"
+        )
+        file_size = msg.animation.file_size or 0
+
+    elif msg.photo:
+
+        media = msg.photo[-1]
+        media_type = "photo"
+        file_name = f"photo_{msg.message_id}.jpg"
+        file_size = media.file_size or 0
+
+    else:
+        return
+
+    if file_size > MAX_FILE_BYTES:
+
+        await msg.reply_text(
+            f"File {MAX_FILE_MB} MB se badi hai. Reject kar di gayi."
         )
 
-        for row in rows:
-            try:
-                await context.bot.copy_message(
-                    chat_id=user.id,
-                    from_chat_id=STORAGE_CHANNEL_ID,
-                    message_id=row["storage_message_id"],
-                )
-
-            except Exception:
-                log.exception(
-                    "Could not deliver stored message %s",
-                    row["storage_message_id"],
-                )
-
-                await update.message.reply_text(
-                    "Ek file deliver nahi ho paayi. Admin ko inform karo."
-                )
-
-        return
-
-    await update.message.reply_text(
-        "Welcome to File Store Bot!\n\n"
-        "Admin files add karne ke liye /addfiles use kare.\n"
-        "Files complete hone ke baad /done bheje.\n\n"
-        "Commands:\n"
-        "/start - Start bot\n"
-        "/addfiles - Naya share link banana shuru\n"
-        "/done - Share link generate\n"
-        "/cancel - Upload cancel\n"
-        "/stats - Bot statistics (admin)"
-    )
-
-
-# =========================
-# ADD FILES COMMAND
-# =========================
-
-async def addfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await update.message.reply_text(
-            "Ye command sirf admin ke liye hai."
-        )
-        return
-
-    if not await require_subscription(update, context):
-        return
-
-    upload_sessions[user_id] = []
-
-    await update.message.reply_text(
-        "Ab files bhejo. Har file 40 MB ya usse chhoti honi chahiye.\n"
-        "Jitni files chaho bhej sakte ho. Complete hone par /done bhejo.\n"
-        "Cancel karne ke liye /cancel."
-    )
-
-
-# =========================
-# FILE SIZE
-# =========================
-
-def get_message_file_size(message):
-    media = message.document or message.video or message.audio
-
-    if media:
-        return media.file_size or 0
-
-    if message.photo:
-        return message.photo[-1].file_size or 0
-
-    animation = message.animation
-
-    if animation:
-        return animation.file_size or 0
-
-    return None
-
-
-# =========================
-# RECEIVE FILE
-# =========================
-
-async def receive_file(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        return
-
-    if user_id not in upload_sessions:
-        await update.message.reply_text(
-            "Pehle /addfiles bhejo."
-        )
-        return
-
-    size = get_message_file_size(update.message)
-
-    if size is None:
-        await update.message.reply_text(
-            "Photo, video, audio, animation ya document bhejo."
-        )
-        return
-
-    if size > MAX_FILE_BYTES:
-        await update.message.reply_text(
-            "File 40 MB se badi hai. Is file ko add nahi kiya."
-        )
-        return
-
-    current_count = len(upload_sessions[user_id])
-
-    if current_count >= MAX_FILES:
-        await update.message.reply_text(
-            "Ek bundle mein maximum 1000 files add kar sakte ho."
-        )
         return
 
     async with db_pool.acquire() as conn:
-        total = await conn.fetchval(
+
+        current = await conn.fetchval(
             "SELECT COUNT(*) FROM files"
         )
 
-    if total + current_count >= MAX_FILES:
-        await update.message.reply_text(
-            "Storage limit 1000 files poori ho chuki hai."
-        )
-        return
+        if current >= MAX_FILES:
+
+            await msg.reply_text(
+                f"Storage limit {MAX_FILES} files poori ho chuki hai."
+            )
+
+            return
 
     try:
+
         copied = await context.bot.copy_message(
             chat_id=STORAGE_CHANNEL_ID,
-            from_chat_id=update.effective_chat.id,
-            message_id=update.message.message_id,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id,
         )
 
-        upload_sessions[user_id].append(
-            (copied.message_id, size)
+    except TelegramError:
+
+        log.exception("File storage copy failed")
+
+        await msg.reply_text(
+            "Storage channel mein file save nahi hui. "
+            "Bot ki admin permissions check karein."
         )
 
-        await update.message.reply_text(
-            f"File add ho gayi. Is bundle mein ab "
-            f"{len(upload_sessions[user_id])} file(s) hain."
-        )
-
-    except Exception as exc:
-        log.exception("Storage copy failed")
-
-        await update.message.reply_text(
-            f"Storage channel mein file save nahi hui: {exc}"
-        )
-
-
-# =========================
-# DONE COMMAND
-# =========================
-
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await update.message.reply_text(
-            "Ye command sirf admin ke liye hai."
-        )
-        return
-
-    items = upload_sessions.get(user_id, [])
-
-    if not items:
-        await update.message.reply_text(
-            "Koi file add nahi hui. /addfiles se shuru karo."
-        )
         return
 
     async with db_pool.acquire() as conn:
-        total = await conn.fetchval(
-            "SELECT COUNT(*) FROM files"
+
+        file_id = await conn.fetchval(
+            """
+            INSERT INTO files(
+                storage_message_id,
+                file_name,
+                file_size,
+                media_type,
+                added_by
+            )
+            VALUES($1, $2, $3, $4, $5)
+            RETURNING id
+            """,
+            copied.message_id,
+            file_name,
+            file_size,
+            media_type,
+            user.id,
         )
 
-        if total + len(items) > MAX_FILES:
-            await update.message.reply_text(
-                "Total storage limit 1000 files cross ho jayegi."
-            )
-            return
+    upload_file_ids.setdefault(user.id, []).append(file_id)
 
-        code = secrets.token_urlsafe(8).replace("-", "").replace("_", "")
+    total_uploaded = len(upload_file_ids[user.id])
+
+    await msg.reply_text(
+        f"File saved successfully!\n\n"
+        f"Name: {file_name}\n"
+        f"File ID: {file_id}\n"
+        f"Size: {file_size / (1024 * 1024):.2f} MB\n"
+        f"Current session files: {total_uploaded}\n\n"
+        "Agli file bhejein ya sab hone par /done likhein."
+    )
+
+
+# =====================================
+# DONE COMMAND
+# =====================================
+
+async def done_upload(update, context):
+
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+
+        await update.effective_message.reply_text(
+            "Access denied."
+        )
+
+        return
+
+    if user_id not in admin_upload_sessions:
+
+        await update.effective_message.reply_text(
+            "Pehle /addfiles likhein."
+        )
+
+        return
+
+    session_ids = upload_file_ids.get(user_id, [])
+
+    if not session_ids:
+
+        admin_upload_sessions.discard(user_id)
+
+        await update.effective_message.reply_text(
+            "Is session mein koi file upload nahi hui."
+        )
+
+        return
+
+    token = secrets.token_hex(16)
+
+    async with db_pool.acquire() as conn:
 
         async with conn.transaction():
+
             await conn.execute(
                 """
-                INSERT INTO bundles(code, created_by)
+                INSERT INTO bundles(token, owner_id)
                 VALUES($1, $2)
                 """,
-                code,
+                token,
                 user_id,
             )
 
-            for position, (message_id, size) in enumerate(
-                items,
-                start=1,
-            ):
-                file_id = await conn.fetchval(
-                    """
-                    INSERT INTO files(
-                        storage_message_id,
-                        file_size,
-                        added_by
-                    )
-                    VALUES($1, $2, $3)
-                    RETURNING id
-                    """,
-                    message_id,
-                    size,
-                    user_id,
-                )
+            for position, file_id in enumerate(session_ids):
 
                 await conn.execute(
                     """
                     INSERT INTO bundle_files(
-                        bundle_code,
+                        bundle_token,
                         file_id,
                         position
                     )
                     VALUES($1, $2, $3)
                     """,
-                    code,
+                    token,
                     file_id,
                     position,
                 )
 
-    upload_sessions.pop(user_id, None)
+    total_files = len(session_ids)
 
-    me = await context.bot.get_me()
-    link = f"https://t.me/{me.username}?start={code}"
+    admin_upload_sessions.discard(user_id)
+    upload_file_ids.pop(user_id, None)
 
-    await update.message.reply_text(
-        f"Done! {len(items)} file(s) ka share link ban gaya:\n\n{link}",
+    link = (
+        f"https://t.me/{BOT_USERNAME}"
+        f"?start=get_{token}"
+    )
+
+    await update.effective_message.reply_text(
+        f"Bundle ready!\n\n"
+        f"Total files: {total_files}\n\n"
+        f"Share link:\n{link}\n\n"
+        f"Link pehli baar open hone par "
+        f"{LINK_EXPIRY_HOURS} ghante ke liye activate hoga.",
         disable_web_page_preview=True,
     )
 
 
-# =========================
-# CANCEL COMMAND
-# =========================
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        return
-
-    upload_sessions.pop(user_id, None)
-
-    await update.message.reply_text(
-        "Current upload session cancel ho gaya. "
-        "Storage channel mein copied files reh sakti hain."
-    )
-
-
-# =========================
+# =====================================
 # STATS COMMAND
-# =========================
+# =====================================
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def stats(update, context):
 
-    if not is_admin(user_id):
-        await update.message.reply_text(
-            "Ye command sirf admin ke liye hai."
-        )
+    if not is_admin(update.effective_user.id):
         return
 
     async with db_pool.acquire() as conn:
-        users = await conn.fetchval(
-            "SELECT COUNT(*) FROM users"
-        )
 
-        files = await conn.fetchval(
+        file_count = await conn.fetchval(
             "SELECT COUNT(*) FROM files"
         )
 
-        bundles = await conn.fetchval(
+        bundle_count = await conn.fetchval(
             "SELECT COUNT(*) FROM bundles"
         )
 
-        size = await conn.fetchval(
+        user_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM users"
+        )
+
+        total_size = await conn.fetchval(
             "SELECT COALESCE(SUM(file_size), 0) FROM files"
         )
 
-    await update.message.reply_text(
-        f"Bot Stats\n\n"
-        f"Users: {users}\n"
-        f"Files: {files}/{MAX_FILES}\n"
-        f"Share links: {bundles}\n"
-        f"Stored size: {size / (1024 * 1024):.2f} MB"
+    await update.effective_message.reply_text(
+        f"ADMIN STATISTICS\n\n"
+        f"Files: {file_count}/{MAX_FILES}\n"
+        f"Bundles: {bundle_count}\n"
+        f"Users: {user_count}\n"
+        f"Stored size: {total_size / (1024 ** 3):.2f} GB"
     )
 
 
-# =========================
-# FASTAPI WEBHOOK
-# =========================
+# =====================================
+# DELIVERY WORKER
+# =====================================
+
+async def worker_loop():
+
+    log.info("Delivery worker started")
+
+    while True:
+
+        try:
+
+            async with db_pool.acquire() as conn:
+
+                job = await conn.fetchrow(
+                    """
+                    SELECT id, bundle_token, user_id, next_index
+                    FROM delivery_jobs
+                    WHERE status IN ('queued', 'running')
+                    ORDER BY created_at
+                    LIMIT 1
+                    """
+                )
+
+            if not job:
+
+                await asyncio.sleep(2)
+                continue
+
+            async with db_pool.acquire() as conn:
+
+                bundle = await conn.fetchrow(
+                    """
+                    SELECT expires_at
+                    FROM bundles
+                    WHERE token = $1
+                    """,
+                    job["bundle_token"],
+                )
+
+                if (
+                    not bundle
+                    or bundle["expires_at"] is None
+                    or bundle["expires_at"] <= datetime.now(timezone.utc)
+                ):
+
+                    await conn.execute(
+                        """
+                        UPDATE delivery_jobs
+                        SET status = 'expired', updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        job["id"],
+                    )
+
+                    continue
+
+                item = await conn.fetchrow(
+                    """
+                    SELECT
+                        f.storage_message_id,
+                        f.file_name
+                    FROM bundle_files bf
+                    JOIN files f ON f.id = bf.file_id
+                    WHERE bf.bundle_token = $1
+                    ORDER BY bf.position
+                    OFFSET $2
+                    LIMIT 1
+                    """,
+                    job["bundle_token"],
+                    job["next_index"],
+                )
+
+            if not item:
+
+                await db_pool.execute(
+                    """
+                    UPDATE delivery_jobs
+                    SET status = 'completed', updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    job["id"],
+                )
+
+                try:
+
+                    await telegram_app.bot.send_message(
+                        chat_id=job["user_id"],
+                        text="Saari files deliver ho gayi hain!",
+                    )
+
+                except TelegramError:
+                    log.exception("Completion message failed")
+
+                continue
+
+            try:
+
+                await telegram_app.bot.copy_message(
+                    chat_id=job["user_id"],
+                    from_chat_id=STORAGE_CHANNEL_ID,
+                    message_id=item["storage_message_id"],
+                )
+
+                await db_pool.execute(
+                    """
+                    UPDATE delivery_jobs
+                    SET
+                        next_index = next_index + 1,
+                        status = 'running',
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    job["id"],
+                )
+
+                await asyncio.sleep(0.08)
+
+            except RetryAfter as error:
+
+                delay = error.retry_after
+
+                if hasattr(delay, "total_seconds"):
+                    delay = delay.total_seconds()
+
+                await asyncio.sleep(float(delay) + 1)
+
+            except TelegramError:
+
+                log.exception(
+                    "Delivery failed for job %s",
+                    job["id"],
+                )
+
+                await db_pool.execute(
+                    """
+                    UPDATE delivery_jobs
+                    SET status = 'failed', updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    job["id"],
+                )
+
+                try:
+
+                    await telegram_app.bot.send_message(
+                        chat_id=job["user_id"],
+                        text=(
+                            "File delivery mein error aaya. "
+                            f"Admin ko Job ID {job['id']} batayein."
+                        ),
+                    )
+
+                except TelegramError:
+                    pass
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+
+            log.exception("Delivery worker error")
+
+            await asyncio.sleep(5)
+
+
+# =====================================
+# FASTAPI LIFESPAN
+# =====================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     global telegram_app
+    global BOT_USERNAME
+    global worker_task
 
     await init_db()
 
@@ -609,11 +1097,11 @@ async def lifespan(app: FastAPI):
     )
 
     telegram_app.add_handler(
-        CommandHandler("done", done)
+        CommandHandler("done", done_upload)
     )
 
     telegram_app.add_handler(
-        CommandHandler("cancel", cancel)
+        CommandHandler("cancel", cancel_upload)
     )
 
     telegram_app.add_handler(
@@ -622,8 +1110,8 @@ async def lifespan(app: FastAPI):
 
     telegram_app.add_handler(
         CallbackQueryHandler(
-            verify_subscription,
-            pattern="^verify_sub$",
+            verify_callback,
+            pattern="^verify$",
         )
     )
 
@@ -643,46 +1131,76 @@ async def lifespan(app: FastAPI):
     await telegram_app.initialize()
     await telegram_app.start()
 
-    if WEBHOOK_URL:
-        await telegram_app.bot.set_webhook(
-            url=f"{WEBHOOK_URL}/telegram",
-            secret_token=WEBHOOK_SECRET or None,
-            allowed_updates=Update.ALL_TYPES,
-        )
+    bot_info = await telegram_app.bot.get_me()
+    BOT_USERNAME = bot_info.username
 
-    log.info("Bot started")
+    await telegram_app.bot.set_webhook(
+        url=f"{WEBHOOK_URL}/telegram",
+        secret_token=WEBHOOK_SECRET or None,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+
+    worker_task = asyncio.create_task(worker_loop())
+
+    log.info("Bot started as @%s", BOT_USERNAME)
 
     try:
+
         yield
 
     finally:
+
+        if worker_task:
+
+            worker_task.cancel()
+
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
         if WEBHOOK_URL:
+
             await telegram_app.bot.delete_webhook()
 
         await telegram_app.stop()
         await telegram_app.shutdown()
+
         await close_db()
 
+        log.info("Bot stopped")
+
+
+# =====================================
+# FASTAPI APP
+# =====================================
 
 app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
 async def home():
+
     return {
-        "status": "File Store Bot is running"
+        "status": "File Store Bot is running",
+        "files_limit": MAX_FILES,
+        "file_size_limit_mb": MAX_FILE_MB,
     }
 
 
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
+
     if WEBHOOK_SECRET:
+
         supplied = request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token",
             "",
         )
 
         if supplied != WEBHOOK_SECRET:
+
             raise HTTPException(
                 status_code=403,
                 detail="Invalid webhook secret",
@@ -695,7 +1213,6 @@ async def telegram_webhook(request: Request):
         telegram_app.bot,
     )
 
-    await telegram_app.process_update(update)
+    await telegram_app.update_queue.put(update)
 
     return {"ok": True}
-        
