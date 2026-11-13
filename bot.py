@@ -39,7 +39,8 @@ MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
-
+print("DEBUG FORCE_CHANNELS:", len(FORCE_CHANNELS))
+print("DEBUG FORCE_LINKS:", len(FORCE_LINKS))
 if len(FORCE_CHANNELS) != 5 or len(FORCE_LINKS) != 5:
     raise RuntimeError("FORCE_CHANNELS aur FORCE_LINKS mein exactly 5-5 values honi chahiye.")
 
